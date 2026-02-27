@@ -7,6 +7,19 @@ Services contain all domain logic. They:
   - Are framework-agnostic (no FastAPI, no direct DB access)
 
 After any state-changing operation, publish a Kafka event via EventPublisher.
+
+Eight services are defined:
+  Repository-backed (persist to DB + publish Kafka events):
+    - PQCMigrationService
+    - CryptoAgilityService
+    - HarvestDefenseService
+    - KeyExchangeService
+    - ComplianceCheckService
+
+  Adapter-orchestration (call cryptographic adapters + persist results):
+    - QuantumKeyOperationsService   — KyberAdapter + DilithiumAdapter operations
+    - HybridTLSService              — HybridKeyExchange adapter coordination
+    - QuantumAuditService           — VulnerabilityScanner + ComplianceVerifier + MigrationPlanner
 """
 
 import uuid
@@ -20,9 +33,17 @@ from aumos_quantum_readiness.adapters.kafka import QuantumReadinessEventPublishe
 from aumos_quantum_readiness.core.interfaces import (
     IAgilityAssessmentRepository,
     IComplianceCheckRepository,
+    ICryptoAgility,
+    IDilithiumAdapter,
+    IHarvestDefenseEngine,
     IHarvestRiskRepository,
+    IHybridKeyExchange,
     IKeyExchangeRepository,
+    IKyberAdapter,
     IPQCMigrationRepository,
+    IQuantumComplianceVerifier,
+    IQuantumMigrationPlanner,
+    IQuantumVulnerabilityScanner,
 )
 from aumos_quantum_readiness.core.models import (
     AgilityAssessment,
@@ -932,3 +953,704 @@ class ComplianceCheckService:
         """
         logger.info("Retrieving compliance status", tenant_id=str(tenant.tenant_id))
         return await self._repository.get_latest(tenant)
+
+
+# ---------------------------------------------------------------------------
+# Adapter-orchestration services (wire new PQC adapters into the service layer)
+# ---------------------------------------------------------------------------
+
+
+class QuantumKeyOperationsService:
+    """Coordinates low-level PQC key operations across Kyber and Dilithium adapters.
+
+    Wraps IKyberAdapter and IDilithiumAdapter to expose key generation,
+    signing, verification, encapsulation, and decapsulation through a
+    single service that persists KeyExchange records and publishes Kafka
+    events for audit and monitoring.
+
+    Args:
+        kyber_adapter: CRYSTALS-Kyber (ML-KEM) key encapsulation adapter.
+        dilithium_adapter: CRYSTALS-Dilithium (ML-DSA) digital signature adapter.
+        key_exchange_repository: Repository for KeyExchange persistence.
+        publisher: Domain event publisher for Kafka events.
+    """
+
+    def __init__(
+        self,
+        kyber_adapter: IKyberAdapter,
+        dilithium_adapter: IDilithiumAdapter,
+        key_exchange_repository: IKeyExchangeRepository,
+        publisher: QuantumReadinessEventPublisher,
+    ) -> None:
+        """Initialise with injected cryptographic adapters and repositories.
+
+        Args:
+            kyber_adapter: Kyber KEM adapter instance.
+            dilithium_adapter: Dilithium DSA adapter instance.
+            key_exchange_repository: Repository for KeyExchange records.
+            publisher: Kafka event publisher.
+        """
+        self._kyber = kyber_adapter
+        self._dilithium = dilithium_adapter
+        self._key_repo = key_exchange_repository
+        self._publisher = publisher
+
+    async def generate_kyber_keypair(
+        self,
+        variant: str,
+        initiated_by: uuid.UUID,
+        tenant: TenantContext,
+    ) -> dict:
+        """Generate a Kyber key pair and persist a KeyExchange record.
+
+        Invokes the Kyber adapter to produce key material, then creates a
+        KeyExchange record capturing the public key fingerprint and parameter
+        metadata. Private key bytes are never persisted.
+
+        Args:
+            variant: Kyber variant ('Kyber-512' | 'Kyber-768' | 'Kyber-1024').
+            initiated_by: UUID of the requesting user.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Dict with public_key_metadata, secret_key_handle,
+            parameter_info, keygen_ms, exchange_id.
+        """
+        logger.info(
+            "Generating Kyber key pair",
+            variant=variant,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        result = await self._kyber.generate_keypair(variant=variant)
+
+        nist_name = result["parameter_info"]["nist_name"]
+        key_exchange = await self._key_repo.create(
+            exchange_algorithm=f"CRYSTALS-Kyber-{variant.split('-')[-1]}",
+            key_encapsulation_mechanism=nist_name,
+            security_level=result["parameter_info"]["security_level"],
+            public_key_fingerprint=result["public_key_metadata"]["fingerprint"],
+            ciphertext_size_bytes=result["parameter_info"].get("ciphertext_bytes", 0),
+            shared_secret_size_bytes=32,
+            is_hybrid=False,
+            initiated_by=initiated_by,
+            exchange_metadata={
+                "keygen_ms": result.get("keygen_ms"),
+                "variant": variant,
+                "fips_reference": result["parameter_info"]["fips_reference"],
+            },
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_key_exchange_completed(
+            tenant_id=tenant.tenant_id,
+            exchange_id=key_exchange.id,
+            exchange_algorithm=nist_name,
+        )
+
+        return {
+            **result,
+            "exchange_id": str(key_exchange.id),
+        }
+
+    async def encapsulate(
+        self,
+        public_key_bytes: bytes,
+        variant: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Encapsulate a shared secret using a Kyber public key.
+
+        Calls the Kyber adapter's encapsulate method. The shared secret is
+        never returned raw — callers receive only the ciphertext and a
+        fingerprint of the secret for audit.
+
+        Args:
+            public_key_bytes: Recipient's Kyber public key.
+            variant: Kyber variant matching the key's parameter set.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with ciphertext_bytes, ciphertext_metadata,
+            shared_secret_fingerprint, encap_ms.
+        """
+        logger.info(
+            "Kyber encapsulation requested",
+            variant=variant,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return await self._kyber.encapsulate(public_key_bytes=public_key_bytes, variant=variant)
+
+    async def sign_message(
+        self,
+        secret_key_bytes: bytes,
+        message: bytes,
+        variant: str,
+        context: bytes | None,
+        tenant: TenantContext,
+    ) -> dict:
+        """Sign a message with a Dilithium private key.
+
+        Args:
+            secret_key_bytes: Signer's Dilithium private key bytes.
+            message: Message bytes to sign.
+            variant: Dilithium variant ('Dilithium-2' | 'Dilithium-3' | 'Dilithium-5').
+            context: Optional domain-separation context bytes.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with signature_bytes, signature_metadata, message_fingerprint,
+            sign_ms.
+        """
+        logger.info(
+            "Dilithium sign requested",
+            variant=variant,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return await self._dilithium.sign(
+            secret_key_bytes=secret_key_bytes,
+            message=message,
+            variant=variant,
+            context=context,
+        )
+
+    async def verify_signature(
+        self,
+        public_key_bytes: bytes,
+        message: bytes,
+        signature_bytes: bytes,
+        variant: str,
+        context: bytes | None,
+        tenant: TenantContext,
+    ) -> dict:
+        """Verify a Dilithium signature.
+
+        Args:
+            public_key_bytes: Signer's Dilithium public key bytes.
+            message: Original message bytes.
+            signature_bytes: Signature to verify.
+            variant: Dilithium variant matching the signer's key.
+            context: Domain-separation context used during signing.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with valid, message_fingerprint, verify_ms, variant.
+        """
+        logger.info(
+            "Dilithium verify requested",
+            variant=variant,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return await self._dilithium.verify(
+            public_key_bytes=public_key_bytes,
+            message=message,
+            signature_bytes=signature_bytes,
+            variant=variant,
+            context=context,
+        )
+
+    async def benchmark_algorithms(
+        self,
+        kyber_variant: str,
+        dilithium_variant: str,
+        iterations: int,
+        tenant: TenantContext,
+    ) -> dict:
+        """Run performance benchmarks for both Kyber and Dilithium variants.
+
+        Args:
+            kyber_variant: Kyber variant to benchmark.
+            dilithium_variant: Dilithium variant to benchmark.
+            iterations: Number of iterations per operation.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with kyber_benchmark and dilithium_benchmark nested results.
+        """
+        logger.info(
+            "PQC algorithm benchmark started",
+            kyber_variant=kyber_variant,
+            dilithium_variant=dilithium_variant,
+            iterations=iterations,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        kyber_result = await self._kyber.benchmark(
+            variant=kyber_variant, iterations=iterations
+        )
+        dilithium_result = await self._dilithium.benchmark(
+            variant=dilithium_variant, iterations=iterations
+        )
+
+        return {
+            "kyber_benchmark": kyber_result,
+            "dilithium_benchmark": dilithium_result,
+            "iterations": iterations,
+        }
+
+
+class HybridTLSService:
+    """Coordinates hybrid classical+PQC TLS key exchange workflows.
+
+    Wraps IHybridKeyExchange and ICryptoAgility adapters to perform
+    algorithm negotiation and hybrid handshake orchestration. On
+    handshake completion, persists a KeyExchange record and publishes
+    a Kafka event for downstream consumers (e.g., aumos-secrets-vault).
+
+    Args:
+        hybrid_key_exchange: Hybrid X25519+Kyber key exchange adapter.
+        crypto_agility: Algorithm registry and selection adapter.
+        key_exchange_repository: Repository for KeyExchange persistence.
+        publisher: Domain event publisher.
+    """
+
+    def __init__(
+        self,
+        hybrid_key_exchange: IHybridKeyExchange,
+        crypto_agility: ICryptoAgility,
+        key_exchange_repository: IKeyExchangeRepository,
+        publisher: QuantumReadinessEventPublisher,
+    ) -> None:
+        """Initialise with injected adapters and repository.
+
+        Args:
+            hybrid_key_exchange: Hybrid key exchange adapter.
+            crypto_agility: Crypto-agility algorithm selection adapter.
+            key_exchange_repository: Repository for KeyExchange records.
+            publisher: Kafka event publisher.
+        """
+        self._hybrid = hybrid_key_exchange
+        self._agility = crypto_agility
+        self._key_repo = key_exchange_repository
+        self._publisher = publisher
+
+    async def negotiate_and_initiate(
+        self,
+        peer_capabilities: dict,
+        application_context: str,
+        initiated_by: uuid.UUID,
+        tenant: TenantContext,
+    ) -> dict:
+        """Negotiate the best hybrid algorithm and initiate a key exchange.
+
+        Calls the CryptoAgility adapter to select the optimal KEM given peer
+        capabilities, then initiates a hybrid handshake session.
+
+        Args:
+            peer_capabilities: Peer-advertised algorithm constraints (category,
+                min_security_level, max_public_key_bytes).
+            application_context: Application label for HKDF domain separation.
+            initiated_by: UUID of the requesting user.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with session_id, classical_public_key_bytes,
+            pqc_public_key_bytes, selected_algorithm, handshake_ms.
+        """
+        logger.info(
+            "Hybrid TLS negotiation started",
+            application_context=application_context,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        selection = await self._agility.select_algorithm(
+            selection_config={
+                "category": "kem",
+                "min_security_level": peer_capabilities.get("min_security_level", 3),
+                "max_public_key_bytes": peer_capabilities.get("max_public_key_bytes"),
+                "preferred_algorithm": peer_capabilities.get("preferred_kem"),
+            },
+            tenant_id=tenant.tenant_id,
+        )
+
+        handshake_config = {
+            "application_context": application_context,
+            "selected_algorithm": selection.get("selected_algorithm"),
+        }
+        handshake_result = await self._hybrid.initiate_handshake(
+            handshake_config=handshake_config,
+            tenant_id=tenant.tenant_id,
+        )
+
+        return {
+            "selected_algorithm": selection.get("selected_algorithm"),
+            "nist_reference": selection.get("nist_reference"),
+            **handshake_result,
+        }
+
+    async def complete_handshake(
+        self,
+        session_id: str,
+        peer_ciphertext_bytes: bytes,
+        initiated_by: uuid.UUID,
+        tenant: TenantContext,
+    ) -> dict:
+        """Complete a hybrid key exchange and persist the exchange record.
+
+        Args:
+            session_id: Session ID from negotiate_and_initiate.
+            peer_ciphertext_bytes: Kyber ciphertext from the remote peer.
+            initiated_by: UUID of the requesting user.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with combined_secret_fingerprint, key_material_bits,
+            exchange_id, handshake_ms.
+        """
+        logger.info(
+            "Completing hybrid TLS handshake",
+            session_id=session_id,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        result = await self._hybrid.complete_handshake(
+            session_id=session_id,
+            peer_ciphertext_bytes=peer_ciphertext_bytes,
+            tenant_id=tenant.tenant_id,
+        )
+
+        key_exchange = await self._key_repo.create(
+            exchange_algorithm="X25519+CRYSTALS-Kyber",
+            key_encapsulation_mechanism=result.get("hybrid_mode", "X25519+ML-KEM"),
+            security_level=3,
+            public_key_fingerprint=result.get("combined_secret_fingerprint", ""),
+            ciphertext_size_bytes=len(peer_ciphertext_bytes),
+            shared_secret_size_bytes=result.get("key_material_bits", 256) // 8,
+            is_hybrid=True,
+            initiated_by=initiated_by,
+            exchange_metadata={
+                "session_id": session_id,
+                "handshake_ms": result.get("handshake_ms"),
+                "hybrid_mode": result.get("hybrid_mode"),
+            },
+            tenant=tenant,
+            hybrid_classical_algorithm="X25519",
+        )
+
+        await self._publisher.publish_key_exchange_completed(
+            tenant_id=tenant.tenant_id,
+            exchange_id=key_exchange.id,
+            exchange_algorithm="X25519+CRYSTALS-Kyber",
+        )
+
+        return {
+            **result,
+            "exchange_id": str(key_exchange.id),
+        }
+
+
+class QuantumAuditService:
+    """Coordinates quantum vulnerability scanning, compliance verification,
+    and migration planning into a unified audit workflow.
+
+    Orchestrates three adapters — IQuantumVulnerabilityScanner,
+    IQuantumComplianceVerifier, and IQuantumMigrationPlanner — to produce
+    a complete quantum security audit report. On completion, persists a
+    ComplianceCheck record and publishes a Kafka event so downstream
+    systems (aumos-governance-engine) can ingest findings.
+
+    Args:
+        vulnerability_scanner: Quantum vulnerability scanning adapter.
+        compliance_verifier: NIST PQC compliance verification adapter.
+        migration_planner: Quantum migration roadmap planning adapter.
+        harvest_defense_engine: HNDL risk assessment adapter.
+        compliance_repository: Repository for ComplianceCheck records.
+        publisher: Domain event publisher.
+    """
+
+    def __init__(
+        self,
+        vulnerability_scanner: IQuantumVulnerabilityScanner,
+        compliance_verifier: IQuantumComplianceVerifier,
+        migration_planner: IQuantumMigrationPlanner,
+        harvest_defense_engine: IHarvestDefenseEngine,
+        compliance_repository: IComplianceCheckRepository,
+        publisher: QuantumReadinessEventPublisher,
+    ) -> None:
+        """Initialise with injected adapters and repository.
+
+        Args:
+            vulnerability_scanner: Quantum vulnerability scanner adapter.
+            compliance_verifier: NIST PQC compliance verifier adapter.
+            migration_planner: Quantum migration planner adapter.
+            harvest_defense_engine: HNDL defense assessment adapter.
+            compliance_repository: Repository for ComplianceCheck records.
+            publisher: Kafka event publisher.
+        """
+        self._scanner = vulnerability_scanner
+        self._verifier = compliance_verifier
+        self._planner = migration_planner
+        self._harvest = harvest_defense_engine
+        self._compliance_repo = compliance_repository
+        self._publisher = publisher
+
+    async def run_full_audit(
+        self,
+        audit_config: dict,
+        checked_by: uuid.UUID,
+        tenant: TenantContext,
+    ) -> dict:
+        """Execute a comprehensive quantum security audit.
+
+        Runs vulnerability scanning, NIST PQC compliance verification,
+        HNDL risk assessment, and migration planning sequentially. Aggregates
+        results into a single audit report and persists a ComplianceCheck
+        record for the compliance findings.
+
+        Args:
+            audit_config: Audit configuration including:
+                - scan_targets: List of vulnerability scan targets.
+                - algorithm_inventory: Cryptographic asset inventory.
+                - data_assets: List of data assets for HNDL assessment.
+                - organisation_name: Name for compliance certificate.
+                - standard_filter: NIST standards to verify against.
+                - include_migration_plan: bool — generate migration roadmap.
+                - severity_threshold: Minimum severity to include in findings.
+            checked_by: UUID of the user requesting the audit.
+            tenant: Tenant context.
+
+        Returns:
+            Dict with vulnerability_scan, compliance_verification,
+            hndl_assessment, migration_plan (if requested), compliance_check_id,
+            overall_risk_level, audit_summary.
+        """
+        logger.info(
+            "Quantum security audit started",
+            tenant_id=str(tenant.tenant_id),
+            has_scan_targets=bool(audit_config.get("scan_targets")),
+            has_inventory=bool(audit_config.get("algorithm_inventory")),
+        )
+
+        # 1. Vulnerability scan
+        scan_result: dict = {}
+        if audit_config.get("scan_targets"):
+            scan_result = await self._scanner.scan(
+                scan_config={
+                    "scan_targets": audit_config["scan_targets"],
+                    "severity_threshold": audit_config.get("severity_threshold", "medium"),
+                    "include_remediation_plan": True,
+                },
+                tenant_id=tenant.tenant_id,
+            )
+            logger.info(
+                "Vulnerability scan complete",
+                total_findings=scan_result.get("summary", {}).get("total_findings", 0),
+                overall_risk_level=scan_result.get("overall_risk_level"),
+                tenant_id=str(tenant.tenant_id),
+            )
+
+        # 2. NIST PQC compliance verification
+        compliance_result: dict = {}
+        if audit_config.get("algorithm_inventory"):
+            compliance_result = await self._verifier.verify_compliance(
+                verification_config={
+                    "algorithm_inventory": audit_config["algorithm_inventory"],
+                    "standard_filter": audit_config.get("standard_filter", []),
+                    "organisation_name": audit_config.get("organisation_name", "Unknown"),
+                    "include_certificate": True,
+                },
+                tenant_id=tenant.tenant_id,
+            )
+            logger.info(
+                "Compliance verification complete",
+                overall_status=compliance_result.get("overall_status"),
+                compliance_score=compliance_result.get("compliance_score"),
+                tenant_id=str(tenant.tenant_id),
+            )
+
+        # 3. HNDL risk assessment
+        hndl_result: dict = {}
+        if audit_config.get("data_assets"):
+            hndl_result = await self._harvest.assess_hndl_risk(
+                assessment_config={
+                    "data_assets": audit_config["data_assets"],
+                    "threat_model": audit_config.get("threat_model", "baseline"),
+                    "include_defense_strategies": True,
+                },
+                tenant_id=tenant.tenant_id,
+            )
+            logger.info(
+                "HNDL risk assessment complete",
+                priority_assets=len(hndl_result.get("priority_assets", [])),
+                tenant_id=str(tenant.tenant_id),
+            )
+
+        # 4. Migration planning (optional)
+        migration_result: dict = {}
+        if audit_config.get("include_migration_plan") and audit_config.get("algorithm_inventory"):
+            migration_result = await self._planner.assess_and_plan(
+                plan_config={
+                    "crypto_inventory": audit_config["algorithm_inventory"],
+                    "organisation_name": audit_config.get("organisation_name", "Unknown"),
+                    "timeline_months": audit_config.get("timeline_months", 24),
+                    "include_rollback_strategies": True,
+                },
+                tenant_id=tenant.tenant_id,
+            )
+            logger.info(
+                "Migration planning complete",
+                migration_tasks=len(migration_result.get("migration_tasks", [])),
+                tenant_id=str(tenant.tenant_id),
+            )
+
+        # 5. Persist compliance check record
+        overall_status = compliance_result.get("overall_status", "unknown")
+        compliance_score = compliance_result.get("compliance_score", 0.0)
+        control_results = compliance_result.get("control_results", [])
+        controls_passed = sum(1 for c in control_results if c.get("status") == "pass")
+        controls_failed = sum(1 for c in control_results if c.get("status") == "fail")
+        controls_na = sum(1 for c in control_results if c.get("status") == "not_applicable")
+
+        compliance_check = await self._compliance_repo.create(
+            standard="NIST-PQC",
+            standard_version="FIPS-203/204/205",
+            overall_status=overall_status,
+            compliance_score=compliance_score,
+            controls_passed=controls_passed,
+            controls_failed=controls_failed,
+            controls_not_applicable=controls_na,
+            findings=compliance_result.get("gaps", []),
+            remediation_plan={
+                "recommendations": compliance_result.get("recommendations", []),
+                "migration_roadmap": migration_result.get("roadmap", {}),
+            },
+            checked_by=checked_by,
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_compliance_checked(
+            tenant_id=tenant.tenant_id,
+            check_id=compliance_check.id,
+            overall_status=overall_status,
+            compliance_score=compliance_score,
+        )
+
+        # Derive overall risk level from scan + HNDL
+        scan_risk = scan_result.get("overall_risk_level", "low")
+        hndl_risk = hndl_result.get("risk_summary", {}).get("highest_risk_level", "low")
+        risk_order = ["low", "medium", "high", "critical"]
+        overall_risk = max(
+            scan_risk, hndl_risk,
+            key=lambda r: risk_order.index(r) if r in risk_order else 0,
+        )
+
+        audit_summary = {
+            "vulnerability_findings": scan_result.get("summary", {}).get("total_findings", 0),
+            "compliance_score": compliance_score,
+            "compliance_status": overall_status,
+            "hndl_priority_assets": len(hndl_result.get("priority_assets", [])),
+            "migration_tasks_planned": len(migration_result.get("migration_tasks", [])),
+            "overall_risk_level": overall_risk,
+            "compliance_check_id": str(compliance_check.id),
+        }
+
+        logger.info(
+            "Quantum security audit complete",
+            overall_risk_level=overall_risk,
+            compliance_status=overall_status,
+            compliance_check_id=str(compliance_check.id),
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        return {
+            "vulnerability_scan": scan_result,
+            "compliance_verification": compliance_result,
+            "hndl_assessment": hndl_result,
+            "migration_plan": migration_result,
+            "compliance_check_id": str(compliance_check.id),
+            "overall_risk_level": overall_risk,
+            "audit_summary": audit_summary,
+        }
+
+    async def run_vulnerability_scan_only(
+        self,
+        scan_targets: list[dict],
+        severity_threshold: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Execute a standalone vulnerability scan without full audit workflow.
+
+        Args:
+            scan_targets: List of scan target dicts (type + content).
+            severity_threshold: Minimum severity level to include ('low' | 'medium'
+                | 'high' | 'critical').
+            tenant: Tenant context.
+
+        Returns:
+            Vulnerability scanner output dict (findings, summary, remediation_plan).
+        """
+        logger.info(
+            "Standalone vulnerability scan started",
+            num_targets=len(scan_targets),
+            severity_threshold=severity_threshold,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return await self._scanner.scan(
+            scan_config={
+                "scan_targets": scan_targets,
+                "severity_threshold": severity_threshold,
+                "include_remediation_plan": True,
+            },
+            tenant_id=tenant.tenant_id,
+        )
+
+    async def run_compliance_verification_only(
+        self,
+        algorithm_inventory: list[dict],
+        organisation_name: str,
+        standard_filter: list[str],
+        checked_by: uuid.UUID,
+        tenant: TenantContext,
+    ) -> ComplianceCheck:
+        """Execute compliance verification and persist a ComplianceCheck record.
+
+        Args:
+            algorithm_inventory: Cryptographic asset inventory list.
+            organisation_name: Organisation name for compliance certificate.
+            standard_filter: List of NIST standard IDs to restrict checks to.
+            checked_by: UUID of the requesting user.
+            tenant: Tenant context.
+
+        Returns:
+            Persisted ComplianceCheck ORM record.
+        """
+        logger.info(
+            "Standalone compliance verification started",
+            inventory_size=len(algorithm_inventory),
+            standard_filter=standard_filter,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        result = await self._verifier.verify_compliance(
+            verification_config={
+                "algorithm_inventory": algorithm_inventory,
+                "standard_filter": standard_filter,
+                "organisation_name": organisation_name,
+                "include_certificate": True,
+            },
+            tenant_id=tenant.tenant_id,
+        )
+
+        control_results = result.get("control_results", [])
+        compliance_check = await self._compliance_repo.create(
+            standard="NIST-PQC",
+            standard_version=", ".join(standard_filter) if standard_filter else "FIPS-203/204/205",
+            overall_status=result.get("overall_status", "unknown"),
+            compliance_score=result.get("compliance_score", 0.0),
+            controls_passed=sum(1 for c in control_results if c.get("status") == "pass"),
+            controls_failed=sum(1 for c in control_results if c.get("status") == "fail"),
+            controls_not_applicable=sum(1 for c in control_results if c.get("status") == "not_applicable"),
+            findings=result.get("gaps", []),
+            remediation_plan={"recommendations": result.get("recommendations", [])},
+            checked_by=checked_by,
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_compliance_checked(
+            tenant_id=tenant.tenant_id,
+            check_id=compliance_check.id,
+            overall_status=result.get("overall_status", "unknown"),
+            compliance_score=result.get("compliance_score", 0.0),
+        )
+
+        return compliance_check
